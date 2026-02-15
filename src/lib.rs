@@ -13,8 +13,11 @@
 //! #[tokio::main]
 //! async fn main() -> Result<(), libnfs::Error> {
 //!     let client = NfsClient::mount("192.168.1.10", "/export", NfsVersion::V4).await?;
-//!     let data = client.read_file("/path/to/file.txt").await?;
-//!     println!("{}", String::from_utf8_lossy(&data));
+//!     let file = client.open("/path/to/file.txt").await?;
+//!     let mut buf = vec![0u8; 4096];
+//!     let n = file.read_at(&mut buf, 0).await?;
+//!     println!("{}", String::from_utf8_lossy(&buf[..n]));
+//!     file.close().await?;
 //!     Ok(())
 //! }
 //! ```
@@ -26,12 +29,10 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_int, c_void};
 use std::sync::Arc;
 
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 // Re-export the event loop handle and command type.
 pub(crate) use event_loop::{Command, NfsEventLoop};
-
-// ── Error type ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -56,8 +57,6 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-// ── NFS version ─────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NfsVersion {
     V3,
@@ -72,8 +71,6 @@ impl NfsVersion {
         }
     }
 }
-
-// ── Stat result ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct FileStat {
@@ -119,8 +116,6 @@ impl From<&sys::nfs_stat_64> for FileStat {
         }
     }
 }
-
-// ── Callback bridge ─────────────────────────────────────────────────────────
 
 // We use a fixed set of concrete callback functions, one per result-type family.
 
@@ -206,28 +201,34 @@ unsafe extern "C" fn stat_cb(
     }
 }
 
-// ── Concrete callback: result = i32 (read — returns bytes read) ─────────
+// ── Concrete callback: read into caller buffer ─────────────────────────
 
-struct ReadBridge {
-    tx: Option<oneshot::Sender<std::result::Result<Vec<u8>, (i32, String)>>>,
+/// Send wrapper for a raw `*mut u8` destination buffer.
+struct BufPtr(*mut u8);
+unsafe impl Send for BufPtr {}
+
+struct ReadIntoBridge {
+    /// Destination buffer pointer + capacity.
+    buf: BufPtr,
+    buf_len: usize,
+    tx: Option<oneshot::Sender<std::result::Result<usize, (i32, String)>>>,
 }
 
-unsafe extern "C" fn read_cb(
+unsafe extern "C" fn read_into_cb(
     err: c_int,
     nfs: *mut sys::nfs_context,
     data: *mut c_void,
     private_data: *mut c_void,
 ) {
-    let mut bridge = Box::from_raw(private_data as *mut ReadBridge);
+    let mut bridge = Box::from_raw(private_data as *mut ReadIntoBridge);
     let result = if err < 0 {
         let msg = crate::get_error_string(nfs);
         Err((err as i32, msg))
     } else {
-        // For read, `err` is the number of bytes read on success.
-        // `data` points to the read buffer provided by libnfs.
         let bytes_read = err as usize;
-        let slice = std::slice::from_raw_parts(data as *const u8, bytes_read);
-        Ok(slice.to_vec())
+        let to_copy = bytes_read.min(bridge.buf_len);
+        std::ptr::copy_nonoverlapping(data as *const u8, bridge.buf.0, to_copy);
+        Ok(to_copy)
     };
     if let Some(tx) = bridge.tx.take() {
         let _ = tx.send(result);
@@ -258,8 +259,6 @@ unsafe extern "C" fn dir_cb(
     }
 }
 
-// ── Helper ──────────────────────────────────────────────────────────────────
-
 fn get_error_string(nfs: *mut sys::nfs_context) -> String {
     unsafe {
         if nfs.is_null() {
@@ -281,8 +280,6 @@ fn bridge_err(r: std::result::Result<(), (i32, String)>) -> Result<()> {
 fn bridge_result<T>(r: std::result::Result<T, (i32, String)>) -> Result<T> {
     r.map_err(|(code, message)| Error::Nfs { code, message })
 }
-
-// ── NfsClient ───────────────────────────────────────────────────────────────
 
 /// A true-async NFS client connected to one server/export.
 ///
@@ -517,53 +514,10 @@ impl NfsClient {
         })
     }
 
-    // ── High-level: read entire file ────────────────────────────────────
-
-    /// Read the full contents of a file and return them as `Vec<u8>`.
-    ///
-    /// ```rust,no_run
-    /// # use libnfs::{NfsClient, NfsVersion};
-    /// # async fn run() -> libnfs::Result<()> {
-    /// let client = NfsClient::mount("10.0.0.1", "/", NfsVersion::V4).await?;
-    /// let data = client.read_file("/share/hello.txt").await?;
-    /// println!("{}", String::from_utf8_lossy(&data));
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn read_file(&self, path: &str) -> Result<Vec<u8>> {
-        let st = self.stat(path).await?;
-        let size = st.size as usize;
-
-        let file = self.open(path).await?;
-
-        let mut result = Vec::with_capacity(size);
-        let mut offset: u64 = 0;
-
-        while (offset as usize) < size {
-            let remaining = size - offset as usize;
-            let chunk = file.pread(remaining as u64, offset).await?;
-            if chunk.is_empty() {
-                break;
-            }
-            offset += chunk.len() as u64;
-            result.extend_from_slice(&chunk);
-        }
-
-        file.close().await?;
-        Ok(result)
-    }
-
-    /// Convenience: read a file and return it as a UTF-8 `String`.
-    pub async fn read_file_to_string(&self, path: &str) -> Result<String> {
-        let bytes = self.read_file(path).await?;
-        String::from_utf8(bytes)
-            .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
-    }
-
     // ── Directory listing ───────────────────────────────────────────────
 
-    /// List entries in a directory.
-    pub async fn readdir(&self, path: &str) -> Result<Vec<String>> {
+    /// List entries in a directory (names + types).
+    async fn readdir_entries(&self, path: &str) -> Result<Vec<DirEntry>> {
         let path_c = CString::new(path)?;
         let (tx, rx) = oneshot::channel();
 
@@ -582,8 +536,6 @@ impl NfsClient {
 
         let dir = bridge_result(rx.await.map_err(|_| Error::Cancelled)?)?;
 
-        // nfs_readdir / nfs_closedir also access nfs_context, so run
-        // them on the event-loop task too.
         let (entries_tx, entries_rx) = oneshot::channel();
 
         self.submit(Box::new(move |ctx| {
@@ -596,13 +548,50 @@ impl NfsClient {
                 let name = unsafe { CStr::from_ptr((*ent).name) }
                     .to_string_lossy()
                     .into_owned();
-                entries.push(name);
+                let is_dir = unsafe { (*ent).r#type } == sys::DT_DIR;
+                entries.push(DirEntry { name, is_dir });
             }
             unsafe { sys::nfs_closedir(ctx, dir.get()) };
             let _ = entries_tx.send(entries);
         }))?;
 
         entries_rx.await.map_err(|_| Error::Cancelled)
+    }
+
+    /// List entry names in a directory.
+    pub async fn readdir(&self, path: &str) -> Result<Vec<String>> {
+        let entries = self.readdir_entries(path).await?;
+        Ok(entries.into_iter().map(|e| e.name).collect())
+    }
+
+    /// Return an async iterator that recursively walks all paths
+    /// under `root`.
+    ///
+    /// ```rust,no_run
+    /// # use libnfs::{NfsClient, NfsVersion};
+    /// # async fn run() -> libnfs::Result<()> {
+    /// let client = NfsClient::mount("10.0.0.1", "/", NfsVersion::V4).await?;
+    /// let mut entries = client.walk("/share");
+    /// while let Some(path) = entries.next().await {
+    ///     println!("{}", path?);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn walk(&self, root: &str) -> ReadDir {
+        let (tx, rx) = mpsc::channel(64);
+        let client = self.inner.clone();
+        let root = root.to_owned();
+
+        tokio::spawn(async move {
+            let client = NfsClient { inner: client };
+            let _ = walk_inner(&client, &root, &tx).await;
+            // prevent NfsClient::drop from destroying the context —
+            // the caller still owns it.
+            std::mem::forget(client);
+        });
+
+        ReadDir { rx }
     }
 }
 
@@ -626,17 +615,29 @@ impl NfsFile {
         self.client.event_loop.submit(cmd)
     }
 
-    /// Read up to `count` bytes at `offset`. Returns the data read.
-    pub async fn pread(&self, count: u64, offset: u64) -> Result<Vec<u8>> {
+    /// Read up to `buf.len()` bytes at `offset` into `buf`.
+    ///
+    /// Returns the number of bytes actually read (0 at EOF).
+    /// No internal allocation — libnfs copies directly into the
+    /// provided slice.
+    pub async fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
         let (tx, rx) = oneshot::channel();
         let fh = FhPtr(self.fh);
+        let buf_ptr = BufPtr(buf.as_mut_ptr());
+        let buf_len = buf.len();
 
         self.submit(Box::new(move |ctx| {
-            let bridge = Box::new(ReadBridge { tx: Some(tx) });
+            let bridge = Box::new(ReadIntoBridge {
+                buf: buf_ptr,
+                buf_len,
+                tx: Some(tx),
+            });
             let pd = Box::into_raw(bridge) as *mut c_void;
-            let rc = unsafe { sys::nfs_pread_async(ctx, fh.get(), offset, count, read_cb, pd) };
+            let rc = unsafe {
+                sys::nfs_pread_async(ctx, fh.get(), offset, buf_len as u64, read_into_cb, pd)
+            };
             if rc != 0 {
-                let mut bridge = unsafe { Box::from_raw(pd as *mut ReadBridge) };
+                let mut bridge = unsafe { Box::from_raw(pd as *mut ReadIntoBridge) };
                 let msg = get_error_string(ctx);
                 if let Some(tx) = bridge.tx.take() {
                     let _ = tx.send(Err((-1, msg)));
@@ -644,30 +645,7 @@ impl NfsFile {
             }
         }))?;
 
-        let data = bridge_result(rx.await.map_err(|_| Error::Cancelled)?)?;
-        Ok(data)
-    }
-
-    /// Sequential read of up to `count` bytes at the current offset.
-    pub async fn read(&self, count: u64) -> Result<Vec<u8>> {
-        let (tx, rx) = oneshot::channel();
-        let fh = FhPtr(self.fh);
-
-        self.submit(Box::new(move |ctx| {
-            let bridge = Box::new(ReadBridge { tx: Some(tx) });
-            let pd = Box::into_raw(bridge) as *mut c_void;
-            let rc = unsafe { sys::nfs_read_async(ctx, fh.get(), count, read_cb, pd) };
-            if rc != 0 {
-                let mut bridge = unsafe { Box::from_raw(pd as *mut ReadBridge) };
-                let msg = get_error_string(ctx);
-                if let Some(tx) = bridge.tx.take() {
-                    let _ = tx.send(Err((-1, msg)));
-                }
-            }
-        }))?;
-
-        let data = bridge_result(rx.await.map_err(|_| Error::Cancelled)?)?;
-        Ok(data)
+        bridge_result(rx.await.map_err(|_| Error::Cancelled)?)
     }
 
     /// Stat the open file.
@@ -732,24 +710,62 @@ impl Drop for NfsFile {
     }
 }
 
-// ── Convenience free function ───────────────────────────────────────────────
+// ── Directory walking ───────────────────────────────────────────────────────
 
-/// Read an entire file from an NFS server in one call.
+/// A directory entry returned by `readdir`, carrying the name and
+/// whether the entry is itself a directory.
+struct DirEntry {
+    name: String,
+    is_dir: bool,
+}
+
+/// Async iterator over paths produced by [`NfsClient::walk`].
 ///
-/// ```rust,no_run
-/// # async fn run() -> libnfs::Result<()> {
-/// let data = libnfs::read_file_from_server(
-///     "10.0.0.1", "/", "/share/hello.txt", libnfs::NfsVersion::V4,
-/// ).await?;
-/// # Ok(())
-/// # }
-/// ```
-pub async fn read_file_from_server(
-    server: &str,
-    export: &str,
-    file_path: &str,
-    version: NfsVersion,
-) -> Result<Vec<u8>> {
-    let client = NfsClient::mount(server, export, version).await?;
-    client.read_file(file_path).await
+/// Call [`next()`](ReadDir::next) in a loop to consume entries.
+pub struct ReadDir {
+    rx: mpsc::Receiver<Result<String>>,
+}
+
+impl ReadDir {
+    /// Returns the next path, or `None` when the walk is complete.
+    pub async fn next(&mut self) -> Option<Result<String>> {
+        self.rx.recv().await
+    }
+}
+
+/// Recursive helper — depth-first walk sending paths into `tx`.
+fn walk_inner<'a>(
+    client: &'a NfsClient,
+    dir: &'a str,
+    tx: &'a mpsc::Sender<Result<String>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        let entries = client.readdir_entries(dir).await?;
+
+        for entry in entries {
+            if entry.name == "." || entry.name == ".." {
+                continue;
+            }
+
+            let full_path = if dir == "/" {
+                format!("/{}", entry.name)
+            } else {
+                format!("{}/{}", dir, entry.name)
+            };
+
+            if tx.send(Ok(full_path.clone())).await.is_err() {
+                return Ok(()); // receiver dropped
+            }
+
+            if entry.is_dir {
+                if let Err(e) = walk_inner(client, &full_path, tx).await {
+                    if tx.send(Err(e)).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    })
 }

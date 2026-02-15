@@ -15,6 +15,20 @@ async fn main() {
     let client = NfsClient::mount(server, export, NfsVersion::V4)
         .await
         .unwrap();
-    let data = client.read_file(path).await.unwrap();
-    print!("{}", String::from_utf8_lossy(&data));
+    let st = client.stat(path).await.unwrap();
+    let file = client.open(path).await.unwrap();
+    let mut buf = vec![0u8; st.size as usize];
+    let mut offset: usize = 0;
+    while offset < buf.len() {
+        let n = file
+            .read_at(&mut buf[offset..], offset as u64)
+            .await
+            .unwrap();
+        if n == 0 {
+            break;
+        }
+        offset += n;
+    }
+    file.close().await.unwrap();
+    print!("{}", String::from_utf8_lossy(&buf[..offset]));
 }

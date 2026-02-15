@@ -26,13 +26,9 @@ use tokio::task::JoinHandle;
 
 use crate::sys;
 
-// ── Public types ────────────────────────────────────────────────────────────
-
 /// A closure that will be executed on the driver task with exclusive
 /// access to the `nfs_context`.
 pub(crate) type Command = Box<dyn FnOnce(*mut sys::nfs_context) + Send + 'static>;
-
-// ── NfsEventLoop ────────────────────────────────────────────────────────────
 
 /// Handle to the background tokio task that services libnfs I/O.
 pub(crate) struct NfsEventLoop {
@@ -89,9 +85,7 @@ impl NfsEventLoop {
     /// The closure receives `*mut nfs_context` and runs with exclusive
     /// access — no other code touches the context concurrently.
     pub fn submit(&self, cmd: Command) -> crate::Result<()> {
-        self.cmd_tx
-            .send(cmd)
-            .map_err(|_| crate::Error::Cancelled)
+        self.cmd_tx.send(cmd).map_err(|_| crate::Error::Cancelled)
     }
 
     /// Signal the loop to stop at its next iteration.
@@ -106,8 +100,6 @@ impl NfsEventLoop {
     }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────────
-
 /// New-type so we can implement `AsRawFd` without owning the fd.
 struct FdWrapper(RawFd);
 
@@ -120,8 +112,6 @@ impl std::os::unix::io::AsRawFd for FdWrapper {
 /// Send wrapper around `*mut nfs_context`.
 struct CtxPtr(*mut sys::nfs_context);
 unsafe impl Send for CtxPtr {}
-
-// ── The actual loop ─────────────────────────────────────────────────────────
 
 /// POLLOUT constant matching libc (used for eager write flushing).
 const POLLOUT: i32 = 0x004;

@@ -103,6 +103,9 @@ pub const NFS_V3: c_int = 3;
 pub const NFS_V4: c_int = 4;
 pub const O_RDONLY: c_int = 0;
 
+/// `DT_DIR` — the entry is a directory.
+pub const DT_DIR: u32 = 4;
+
 // ── Extern functions ────────────────────────────────────────────────────────
 
 extern "C" {
