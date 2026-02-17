@@ -53,6 +53,9 @@ pub enum Error {
 
     #[error("operation cancelled")]
     Cancelled,
+
+    #[error("operation timed out after {0} seconds")]
+    Timeout(u64),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -143,12 +146,17 @@ unsafe extern "C" fn void_cb(
                 CStr::from_ptr(p).to_string_lossy().into_owned()
             }
         };
+        eprintln!("[libnfs] void_cb: err={err} msg={msg}");
         Err((err as i32, msg))
     } else {
+        eprintln!("[libnfs] void_cb: success (err={err})");
         Ok(())
     };
     if let Some(tx) = bridge.tx.take() {
+        eprintln!("[libnfs] void_cb: sending result through oneshot");
         let _ = tx.send(result);
+    } else {
+        eprintln!("[libnfs] void_cb: WARNING — no sender available (already taken?)");
     }
 }
 
@@ -364,10 +372,16 @@ impl NfsClient {
     /// # }
     /// ```
     pub async fn mount(server: &str, export: &str, version: NfsVersion) -> Result<Self> {
+        eprintln!("[libnfs] mount: server={server} export={export} version={version:?}");
         let ctx = unsafe { sys::nfs_init_context() };
         if ctx.is_null() {
+            eprintln!("[libnfs] mount: nfs_init_context returned null");
             return Err(Error::ContextCreation);
         }
+        eprintln!(
+            "[libnfs] mount: context created, setting version to {:?}",
+            version
+        );
         unsafe { sys::nfs_set_version(ctx, version.as_raw()) };
 
         // Submit the async mount.
@@ -378,6 +392,7 @@ impl NfsClient {
         let bridge = Box::new(VoidBridge { tx: Some(tx) });
         let private_data = Box::into_raw(bridge) as *mut c_void;
 
+        eprintln!("[libnfs] mount: calling nfs_mount_async");
         let rc = unsafe {
             sys::nfs_mount_async(
                 ctx,
@@ -388,19 +403,41 @@ impl NfsClient {
             )
         };
         if rc != 0 {
-            // Reclaim the bridge so it doesn't leak.
-            unsafe { drop(Box::from_raw(private_data as *mut VoidBridge)) };
             let msg = get_error_string(ctx);
+            eprintln!("[libnfs] mount: nfs_mount_async failed rc={rc}: {msg}");
+            unsafe { drop(Box::from_raw(private_data as *mut VoidBridge)) };
             unsafe { sys::nfs_destroy_context(ctx) };
             return Err(Error::Submit(msg));
         }
 
-        // Start the event loop to drive this mount to completion.
-        let event_loop = NfsEventLoop::start(ctx)?;
+        let initial_fd = unsafe { sys::nfs_get_fd(ctx) };
+        eprintln!("[libnfs] mount: nfs_mount_async ok, initial fd={initial_fd}");
 
-        let result = rx.await.map_err(|_| Error::Cancelled)?;
+        // Start the event loop to drive this mount to completion.
+        eprintln!("[libnfs] mount: starting event loop");
+        let event_loop = NfsEventLoop::start(ctx)?;
+        eprintln!("[libnfs] mount: event loop started, waiting for mount callback (timeout=30s)");
+
+        let timeout_secs = 30u64;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await;
+
+        match &result {
+            Err(_) => eprintln!(
+                "[libnfs] mount: TIMED OUT after {timeout_secs}s — mount callback never fired"
+            ),
+            Ok(Err(_)) => eprintln!("[libnfs] mount: oneshot channel dropped (event loop exited?)"),
+            Ok(Ok(Err((code, msg)))) => {
+                eprintln!("[libnfs] mount: callback returned error code={code}: {msg}")
+            }
+            Ok(Ok(Ok(()))) => eprintln!("[libnfs] mount: callback returned success"),
+        }
+
+        let result = result
+            .map_err(|_| Error::Timeout(timeout_secs))?
+            .map_err(|_| Error::Cancelled)?;
         bridge_err(result)?;
 
+        eprintln!("[libnfs] mount: mount complete, client ready");
         let inner = Arc::new(NfsInner { ctx, event_loop });
         Ok(Self { inner })
     }
@@ -448,7 +485,11 @@ impl NfsClient {
 
         let event_loop = NfsEventLoop::start(ctx)?;
 
-        let result = rx.await.map_err(|_| Error::Cancelled)?;
+        let timeout_secs = 30u64;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
+            .await
+            .map_err(|_| Error::Timeout(timeout_secs))?
+            .map_err(|_| Error::Cancelled)?;
         bridge_err(result)?;
 
         let inner = Arc::new(NfsInner { ctx, event_loop });

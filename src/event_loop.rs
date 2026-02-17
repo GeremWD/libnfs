@@ -11,8 +11,10 @@
 //! channel, ensuring thread safety with any tokio runtime flavour.
 //!
 //! **Important:** libnfs may change its underlying fd during multi-step
-//! operations like mount (portmapper → mountd → nfsd).  The loop detects
-//! fd changes via `nfs_get_fd()` and re-creates the `AsyncFd` accordingly.
+//! operations like NFSv3 mount (portmapper → mountd → nfsd).  After every
+//! `nfs_service` call the loop re-creates the `AsyncFd` to guarantee a
+//! fresh epoll registration — this handles both fd-number changes *and*
+//! fd-number reuse (where the OS assigns the same number to the new socket).
 
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,8 +115,88 @@ impl std::os::unix::io::AsRawFd for FdWrapper {
 struct CtxPtr(*mut sys::nfs_context);
 unsafe impl Send for CtxPtr {}
 
-/// POLLOUT constant matching libc (used for eager write flushing).
-const POLLOUT: i32 = 0x004;
+/// Create (or re-create) an `AsyncFd` for the current libnfs fd.
+/// Returns `None` if the fd is invalid.
+fn make_async_fd(ctx: *mut sys::nfs_context) -> Option<(RawFd, AsyncFd<FdWrapper>)> {
+    let fd: RawFd = unsafe { sys::nfs_get_fd(ctx) };
+    if fd < 0 {
+        eprintln!("[libnfs] make_async_fd: nfs_get_fd returned {fd} (invalid)");
+        return None;
+    }
+    match AsyncFd::new(FdWrapper(fd)) {
+        Ok(afd) => {
+            eprintln!("[libnfs] make_async_fd: registered fd={fd} with epoll");
+            Some((fd, afd))
+        }
+        Err(e) => {
+            eprintln!("[libnfs] make_async_fd: AsyncFd::new(fd={fd}) failed: {e}");
+            None
+        }
+    }
+}
+
+/// Format poll flags as a human-readable string.
+fn fmt_poll(flags: i32) -> String {
+    let mut s = String::new();
+    if flags & 0x001 != 0 {
+        s.push_str("POLLIN");
+    }
+    if flags & 0x004 != 0 {
+        if !s.is_empty() {
+            s.push('|');
+        }
+        s.push_str("POLLOUT");
+    }
+    if flags & 0x008 != 0 {
+        if !s.is_empty() {
+            s.push('|');
+        }
+        s.push_str("POLLERR");
+    }
+    if flags & 0x010 != 0 {
+        if !s.is_empty() {
+            s.push('|');
+        }
+        s.push_str("POLLHUP");
+    }
+    if s.is_empty() {
+        s.push_str("(none)");
+    }
+    s
+}
+
+/// Do a non-blocking `poll(2)` on `fd` for `wanted` events and, if any
+/// are ready, feed them to `nfs_service`.  Returns `true` if service
+/// was called.
+fn try_service(ctx: *mut sys::nfs_context, fd: RawFd, wanted: i32) -> bool {
+    if wanted == 0 {
+        return false;
+    }
+    let mut pfd = libc::pollfd {
+        fd,
+        events: wanted as i16,
+        revents: 0,
+    };
+    let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+    if ret > 0 && pfd.revents != 0 {
+        eprintln!(
+            "[libnfs] try_service: fd={fd} wanted={} ready={} → nfs_service",
+            fmt_poll(wanted),
+            fmt_poll(pfd.revents as i32)
+        );
+        let fd_before = unsafe { sys::nfs_get_fd(ctx) };
+        unsafe { sys::nfs_service(ctx, pfd.revents as i32) };
+        let fd_after = unsafe { sys::nfs_get_fd(ctx) };
+        if fd_after != fd_before {
+            eprintln!(
+                "[libnfs] try_service: fd changed {fd_before} → {fd_after} after nfs_service"
+            );
+        }
+        true
+    } else {
+        false
+    }
+}
 
 async fn driver_loop(
     ctx: CtxPtr,
@@ -122,106 +204,156 @@ async fn driver_loop(
     notify: Arc<Notify>,
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
 ) {
-    // Track the current fd so we can detect when libnfs switches sockets
-    // (e.g. portmapper → mountd → nfsd during mount).
-    let mut current_fd: RawFd = unsafe { sys::nfs_get_fd(ctx.0) };
-    let mut async_fd = match AsyncFd::new(FdWrapper(current_fd)) {
-        Ok(a) => a,
-        Err(_) => return,
+    eprintln!("[libnfs] driver_loop: starting");
+    let (mut current_fd, mut async_fd) = match make_async_fd(ctx.0) {
+        Some(pair) => pair,
+        None => {
+            eprintln!("[libnfs] driver_loop: initial make_async_fd failed, exiting");
+            return;
+        }
     };
+    eprintln!("[libnfs] driver_loop: initial fd={current_fd}");
+
+    // Eagerly service on startup: the initial connect may have already
+    // completed between nfs_mount_async() and the task starting.
+    let w = unsafe { sys::nfs_which_events(ctx.0) };
+    eprintln!(
+        "[libnfs] driver_loop: startup eager service, wanted={}",
+        fmt_poll(w)
+    );
+    try_service(ctx.0, current_fd, w);
+
+    let mut iteration: u64 = 0;
 
     loop {
+        iteration += 1;
+
         if stop.load(Ordering::Acquire) {
+            eprintln!("[libnfs] driver_loop: stop flag set, exiting");
             break;
         }
 
-        // ── Detect fd change ────────────────────────────────────────
-        // libnfs may close and reconnect internally (portmapper →
-        // mountd → nfsd).  Re-register with epoll if the fd changed.
+        // ── Refresh AsyncFd ─────────────────────────────────────────
         let latest_fd = unsafe { sys::nfs_get_fd(ctx.0) };
-        if latest_fd != current_fd {
-            if latest_fd < 0 {
+        if latest_fd < 0 {
+            eprintln!(
+                "[libnfs] driver_loop [#{iteration}]: fd={latest_fd} (invalid), sleeping 5ms"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let retry_fd = unsafe { sys::nfs_get_fd(ctx.0) };
+            if retry_fd < 0 {
+                eprintln!(
+                    "[libnfs] driver_loop [#{iteration}]: fd still {retry_fd} after sleep, exiting"
+                );
                 break;
             }
+        }
+        // Re-check after potential sleep.
+        let latest_fd = unsafe { sys::nfs_get_fd(ctx.0) };
+        if latest_fd < 0 {
+            eprintln!("[libnfs] driver_loop [#{iteration}]: fd={latest_fd} after recheck, exiting");
+            break;
+        }
+        if latest_fd != current_fd {
+            eprintln!("[libnfs] driver_loop [#{iteration}]: fd changed {current_fd} → {latest_fd}");
             current_fd = latest_fd;
             async_fd = match AsyncFd::new(FdWrapper(current_fd)) {
                 Ok(a) => a,
-                Err(_) => break,
-            };
-            // The new socket may already be connected (especially on
-            // localhost).  We may have missed the epoll edge, so do a
-            // non-blocking poll(2) to check *actual* readiness before
-            // calling nfs_service.  Previously we passed the WANTED
-            // events straight to nfs_service, which told libnfs that
-            // POLLOUT had occurred even when a connect() was still in
-            // progress — breaking NFSv3 mounts over the network.
-            let w = unsafe { sys::nfs_which_events(ctx.0) };
-            if w != 0 {
-                let mut pfd = libc::pollfd {
-                    fd: current_fd,
-                    events: w as i16,
-                    revents: 0,
-                };
-                let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
-                if ret > 0 && pfd.revents != 0 {
-                    unsafe { sys::nfs_service(ctx.0, pfd.revents as i32) };
+                Err(e) => {
+                    eprintln!("[libnfs] driver_loop [#{iteration}]: AsyncFd::new(fd={current_fd}) failed: {e}, exiting");
+                    break;
                 }
+            };
+            // Eagerly check for ready events on the new fd.
+            let w = unsafe { sys::nfs_which_events(ctx.0) };
+            eprintln!(
+                "[libnfs] driver_loop [#{iteration}]: new fd eager service, wanted={}",
+                fmt_poll(w)
+            );
+            if try_service(ctx.0, current_fd, w) {
+                continue; // fd may have changed again
             }
-            continue; // re-check fd (may have changed again)
         }
 
         // ── Wait for I/O readiness, a command, or stop ──────────────
         let wanted = unsafe { sys::nfs_which_events(ctx.0) };
         let interest = poll_flags_to_interest(wanted);
 
+        // Only log every Nth iteration to avoid flooding, but always
+        // log interesting state changes.
+        if iteration <= 20 || iteration % 100 == 0 {
+            eprintln!(
+                "[libnfs] driver_loop [#{iteration}]: waiting on fd={current_fd} wanted={}",
+                fmt_poll(wanted)
+            );
+        }
+
         tokio::select! {
             ready = async_fd.ready(interest) => {
                 match ready {
                     Ok(mut guard) => {
                         let revents = interest_to_poll_flags(&guard);
+                        eprintln!("[libnfs] driver_loop [#{iteration}]: ready fd={current_fd} revents={}", fmt_poll(revents));
+                        let fd_before = unsafe { sys::nfs_get_fd(ctx.0) };
                         unsafe { sys::nfs_service(ctx.0, revents) };
+                        let fd_after = unsafe { sys::nfs_get_fd(ctx.0) };
+                        if fd_after != fd_before {
+                            eprintln!("[libnfs] driver_loop [#{iteration}]: fd changed {fd_before} → {fd_after} after nfs_service");
+                        }
                         guard.clear_ready();
                     }
-                    Err(_) => continue,
+                    Err(e) => {
+                        eprintln!("[libnfs] driver_loop [#{iteration}]: ready() error: {e}");
+                    }
                 }
             }
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(cmd) => {
+                        eprintln!("[libnfs] driver_loop [#{iteration}]: executing command");
                         cmd(ctx.0);
-                        // Drain any additional queued commands so we
-                        // batch-submit before flushing writes.
+                        let mut extra = 0u32;
                         while let Ok(cmd) = cmd_rx.try_recv() {
                             cmd(ctx.0);
+                            extra += 1;
+                        }
+                        if extra > 0 {
+                            eprintln!("[libnfs] driver_loop [#{iteration}]: drained {extra} extra commands");
                         }
                     }
-                    None => break, // Channel closed — shutting down.
+                    None => {
+                        eprintln!("[libnfs] driver_loop [#{iteration}]: command channel closed, exiting");
+                        break;
+                    }
                 }
             }
             _ = notify.notified() => {
-                // Stop signal — re-check flag at top of loop.
+                eprintln!("[libnfs] driver_loop [#{iteration}]: notified (stop signal)");
             }
         }
 
-        // ── Eagerly flush pending writes ────────────────────────────
-        // After any wakeup we check whether libnfs has queued output.
-        // This is necessary because edge-triggered epoll won't
-        // re-notify for POLLOUT on an already-writable socket.
-        // Use a non-blocking poll(2) to verify actual writability
-        // before telling libnfs POLLOUT occurred.
-        let post = unsafe { sys::nfs_which_events(ctx.0) };
-        if post & POLLOUT != 0 {
-            let mut pfd = libc::pollfd {
-                fd: current_fd,
-                events: POLLOUT as i16,
-                revents: 0,
-            };
-            let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
-            if ret > 0 && pfd.revents != 0 {
-                unsafe { sys::nfs_service(ctx.0, pfd.revents as i32) };
+        // ── After any wakeup, re-create AsyncFd ────────────────────
+        let new_fd = unsafe { sys::nfs_get_fd(ctx.0) };
+        if new_fd >= 0 {
+            if new_fd != current_fd {
+                eprintln!("[libnfs] driver_loop [#{iteration}]: post-wakeup fd changed {current_fd} → {new_fd}");
             }
+            current_fd = new_fd;
+            async_fd = match AsyncFd::new(FdWrapper(current_fd)) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("[libnfs] driver_loop [#{iteration}]: post-wakeup AsyncFd::new(fd={current_fd}) failed: {e}, exiting");
+                    break;
+                }
+            };
+            // Eagerly service any pending events on the (possibly new) fd.
+            let post = unsafe { sys::nfs_which_events(ctx.0) };
+            try_service(ctx.0, current_fd, post);
+        } else {
+            eprintln!("[libnfs] driver_loop [#{iteration}]: post-wakeup fd={new_fd} (invalid)");
         }
     }
+    eprintln!("[libnfs] driver_loop: exited main loop");
 }
 
 /// Map libnfs `nfs_which_events()` return (POLLIN/POLLOUT bitmask) to
