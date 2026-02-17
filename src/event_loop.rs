@@ -149,11 +149,23 @@ async fn driver_loop(
                 Err(_) => break,
             };
             // The new socket may already be connected (especially on
-            // localhost).  We just missed the epoll edge, so service
-            // the fd immediately to avoid a deadlock.
+            // localhost).  We may have missed the epoll edge, so do a
+            // non-blocking poll(2) to check *actual* readiness before
+            // calling nfs_service.  Previously we passed the WANTED
+            // events straight to nfs_service, which told libnfs that
+            // POLLOUT had occurred even when a connect() was still in
+            // progress — breaking NFSv3 mounts over the network.
             let w = unsafe { sys::nfs_which_events(ctx.0) };
             if w != 0 {
-                unsafe { sys::nfs_service(ctx.0, w) };
+                let mut pfd = libc::pollfd {
+                    fd: current_fd,
+                    events: w as i16,
+                    revents: 0,
+                };
+                let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+                if ret > 0 && pfd.revents != 0 {
+                    unsafe { sys::nfs_service(ctx.0, pfd.revents as i32) };
+                }
             }
             continue; // re-check fd (may have changed again)
         }
@@ -195,13 +207,19 @@ async fn driver_loop(
         // After any wakeup we check whether libnfs has queued output.
         // This is necessary because edge-triggered epoll won't
         // re-notify for POLLOUT on an already-writable socket.
-        // nfs_service handles EAGAIN internally, so speculative calls
-        // are safe.  If the write truly blocks, nfs_which_events will
-        // keep returning POLLOUT and the next async_fd.ready(WRITABLE)
-        // will deliver the edge when the send buffer drains.
+        // Use a non-blocking poll(2) to verify actual writability
+        // before telling libnfs POLLOUT occurred.
         let post = unsafe { sys::nfs_which_events(ctx.0) };
         if post & POLLOUT != 0 {
-            unsafe { sys::nfs_service(ctx.0, post) };
+            let mut pfd = libc::pollfd {
+                fd: current_fd,
+                events: POLLOUT as i16,
+                revents: 0,
+            };
+            let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+            if ret > 0 && pfd.revents != 0 {
+                unsafe { sys::nfs_service(ctx.0, pfd.revents as i32) };
+            }
         }
     }
 }
