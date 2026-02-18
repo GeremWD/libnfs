@@ -3,7 +3,7 @@
 //! Usage: cat [server] [export] [path]
 //! Default: cat 127.0.0.1 / /hello.txt
 
-use libnfs::{NfsClient, NfsVersion};
+use libnfs::{Client, Version};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -12,9 +12,7 @@ async fn main() {
     let export = args.get(2).map(|s| s.as_str()).unwrap_or("/");
     let path = args.get(3).map(|s| s.as_str()).unwrap_or("/hello.txt");
 
-    let client = NfsClient::mount(server, export, NfsVersion::V4)
-        .await
-        .unwrap();
+    let client = Client::mount(server, export, Version::V4).await.unwrap();
     let st = client.stat(path).await.unwrap();
     let file = client.open(path).await.unwrap();
     let mut buf = vec![0u8; st.size as usize];

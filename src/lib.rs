@@ -32,7 +32,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 // Re-export the event loop handle and command type.
-pub(crate) use event_loop::{Command, NfsEventLoop};
+pub(crate) use event_loop::{Command, EventLoop};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -61,16 +61,16 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NfsVersion {
+pub enum Version {
     V3,
     V4,
 }
 
-impl NfsVersion {
+impl Version {
     fn as_raw(self) -> c_int {
         match self {
-            NfsVersion::V3 => sys::NFS_V3,
-            NfsVersion::V4 => sys::NFS_V4,
+            Version::V3 => sys::NFS_V3,
+            Version::V4 => sys::NFS_V4,
         }
     }
 }
@@ -295,7 +295,7 @@ fn bridge_result<T>(r: std::result::Result<T, (i32, String)>) -> Result<T> {
 /// drives libnfs I/O on the tokio reactor.
 ///
 /// All public methods are `async` and non-blocking.
-pub struct NfsClient {
+pub struct Client {
     inner: Arc<NfsInner>,
 }
 
@@ -306,7 +306,7 @@ struct NfsInner {
     /// and in [`Drop`].  Never touched directly from client methods.
     ctx: *mut sys::nfs_context,
     /// Handle to the event-loop background task.
-    event_loop: NfsEventLoop,
+    event_loop: EventLoop,
 }
 
 // Safety: All post-construction access to nfs_context is serialised
@@ -360,7 +360,7 @@ impl Drop for NfsInner {
     }
 }
 
-impl NfsClient {
+impl Client {
     /// Connect to an NFS server, mount the export, and return a client
     /// ready for async file operations.
     ///
@@ -371,7 +371,7 @@ impl NfsClient {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn mount(server: &str, export: &str, version: NfsVersion) -> Result<Self> {
+    pub async fn mount(server: &str, export: &str, version: Version) -> Result<Self> {
         eprintln!("[libnfs] mount: server={server} export={export} version={version:?}");
         let ctx = unsafe { sys::nfs_init_context() };
         if ctx.is_null() {
@@ -415,7 +415,7 @@ impl NfsClient {
 
         // Start the event loop to drive this mount to completion.
         eprintln!("[libnfs] mount: starting event loop");
-        let event_loop = NfsEventLoop::start(ctx)?;
+        let event_loop = EventLoop::start(ctx)?;
         eprintln!("[libnfs] mount: event loop started, waiting for mount callback (timeout=30s)");
 
         let timeout_secs = 30u64;
@@ -446,7 +446,7 @@ impl NfsClient {
     pub async fn mount_as(
         server: &str,
         export: &str,
-        version: NfsVersion,
+        version: Version,
         uid: u32,
         gid: u32,
     ) -> Result<Self> {
@@ -483,7 +483,7 @@ impl NfsClient {
             return Err(Error::Submit(msg));
         }
 
-        let event_loop = NfsEventLoop::start(ctx)?;
+        let event_loop = EventLoop::start(ctx)?;
 
         let timeout_secs = 30u64;
         let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
@@ -531,7 +531,7 @@ impl NfsClient {
     // ── Open / Close ────────────────────────────────────────────────────
 
     /// Open a file for reading.
-    pub async fn open(&self, path: &str) -> Result<NfsFile> {
+    pub async fn open(&self, path: &str) -> Result<File> {
         let path_c = CString::new(path)?;
         let (tx, rx) = oneshot::channel();
 
@@ -549,7 +549,7 @@ impl NfsClient {
         }))?;
 
         let fh = bridge_result(rx.await.map_err(|_| Error::Cancelled)?)?;
-        Ok(NfsFile {
+        Ok(File {
             client: self.inner.clone(),
             fh: fh.get(),
         })
@@ -625,7 +625,7 @@ impl NfsClient {
         let root = root.to_owned();
 
         tokio::spawn(async move {
-            let client = NfsClient { inner: client };
+            let client = Client { inner: client };
             let _ = walk_inner(&client, &root, &tx).await;
             // prevent NfsClient::drop from destroying the context —
             // the caller still owns it.
@@ -636,21 +636,19 @@ impl NfsClient {
     }
 }
 
-// ── NfsFile ─────────────────────────────────────────────────────────────────
-
 /// An open file handle on an NFS share.
 ///
 /// All reads/writes are truly async — they submit libnfs async operations
 /// and await completion through the tokio reactor.
-pub struct NfsFile {
+pub struct File {
     client: Arc<NfsInner>,
     fh: *mut sys::nfsfh,
 }
 
-unsafe impl Send for NfsFile {}
-unsafe impl Sync for NfsFile {}
+unsafe impl Send for File {}
+unsafe impl Sync for File {}
 
-impl NfsFile {
+impl File {
     /// Submit a command closure to run on the event-loop task.
     fn submit(&self, cmd: Command) -> Result<()> {
         self.client.event_loop.submit(cmd)
@@ -736,7 +734,7 @@ impl NfsFile {
     }
 }
 
-impl Drop for NfsFile {
+impl Drop for File {
     fn drop(&mut self) {
         // Best-effort close. In async code prefer calling
         // `file.close().await` explicitly.
@@ -776,7 +774,7 @@ impl ReadDir {
 
 /// Recursive helper — depth-first walk sending paths into `tx`.
 fn walk_inner<'a>(
-    client: &'a NfsClient,
+    client: &'a Client,
     dir: &'a str,
     tx: &'a mpsc::Sender<Result<String>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {

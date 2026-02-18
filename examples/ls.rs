@@ -3,7 +3,7 @@
 //! Usage: ls [server] [export] [path]
 //! Default: ls 127.0.0.1 / /
 
-use libnfs::{NfsClient, NfsVersion};
+use libnfs::{Client, Version};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -12,9 +12,7 @@ async fn main() {
     let export = args.get(2).map(|s| s.as_str()).unwrap_or("/");
     let path = args.get(3).map(|s| s.as_str()).unwrap_or("/");
 
-    let client = NfsClient::mount(server, export, NfsVersion::V4)
-        .await
-        .unwrap();
+    let client = Client::mount(server, export, Version::V4).await.unwrap();
     let entries = client.readdir(path).await.unwrap();
 
     for name in &entries {

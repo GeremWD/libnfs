@@ -33,7 +33,7 @@ use crate::sys;
 pub(crate) type Command = Box<dyn FnOnce(*mut sys::nfs_context) + Send + 'static>;
 
 /// Handle to the background tokio task that services libnfs I/O.
-pub(crate) struct NfsEventLoop {
+pub(crate) struct EventLoop {
     /// Shared flag to tell the loop to exit.
     stop: Arc<AtomicBool>,
     /// Notify handle to wake the loop for shutdown.
@@ -44,7 +44,7 @@ pub(crate) struct NfsEventLoop {
     cmd_tx: mpsc::UnboundedSender<Command>,
 }
 
-impl NfsEventLoop {
+impl EventLoop {
     /// Spawn the driver task for the given NFS context.
     ///
     /// # Safety
