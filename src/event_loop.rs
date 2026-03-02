@@ -257,6 +257,9 @@ async fn driver_loop(
         if latest_fd != current_fd {
             eprintln!("[libnfs] driver_loop [#{iteration}]: fd changed {current_fd} → {latest_fd}");
             current_fd = latest_fd;
+            // Drop old AsyncFd first to deregister from epoll before
+            // registering the new fd (avoids EEXIST on fd reuse).
+            drop(async_fd);
             async_fd = match AsyncFd::new(FdWrapper(current_fd)) {
                 Ok(a) => a,
                 Err(e) => {
@@ -339,6 +342,9 @@ async fn driver_loop(
                 eprintln!("[libnfs] driver_loop [#{iteration}]: post-wakeup fd changed {current_fd} → {new_fd}");
             }
             current_fd = new_fd;
+            // Drop old AsyncFd first to deregister from epoll before
+            // registering the (possibly reused) fd.
+            drop(async_fd);
             async_fd = match AsyncFd::new(FdWrapper(current_fd)) {
                 Ok(a) => a,
                 Err(e) => {
