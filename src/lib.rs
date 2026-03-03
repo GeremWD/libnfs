@@ -554,7 +554,8 @@ impl Client {
         self.submit(Box::new(move |ctx| {
             let bridge = Box::new(FhBridge { tx: Some(tx) });
             let pd = Box::into_raw(bridge) as *mut c_void;
-            let rc = unsafe { sys::nfs_open_async(ctx, path_c.as_ptr(), sys::O_RDONLY, open_cb, pd) };
+            let rc =
+                unsafe { sys::nfs_open_async(ctx, path_c.as_ptr(), sys::O_RDONLY, open_cb, pd) };
             if rc != 0 {
                 let mut bridge = unsafe { Box::from_raw(pd as *mut FhBridge) };
                 let msg = get_error_message(ctx, rc);
