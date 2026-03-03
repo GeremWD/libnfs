@@ -115,6 +115,7 @@ extern "C" {
     pub fn nfs_set_version(nfs: *mut nfs_context, version: c_int);
     pub fn nfs_set_uid(nfs: *mut nfs_context, uid: c_int);
     pub fn nfs_set_gid(nfs: *mut nfs_context, gid: c_int);
+    pub fn nfs_set_debug(nfs: *mut nfs_context, level: c_int);
     pub fn nfs_get_error(nfs: *mut nfs_context) -> *mut c_char;
 
     // ── Event-loop plumbing ─────────────────────────────────────────────

@@ -123,40 +123,34 @@ impl From<&sys::nfs_stat_64> for FileStat {
 // We use a fixed set of concrete callback functions, one per result-type family.
 
 // ── Concrete callback: result = () (mount, close, unlink, mkdir, etc.) ──
+//
+// Named "completion" because these operations return no data on success,
+// only a success/failure indication.
 
-struct VoidBridge {
+struct CompletionBridge {
     tx: Option<oneshot::Sender<std::result::Result<(), (i32, String)>>>,
 }
 
-unsafe extern "C" fn void_cb(
+unsafe extern "C" fn completion_cb(
     err: c_int,
     nfs: *mut sys::nfs_context,
     _data: *mut c_void,
     private_data: *mut c_void,
 ) {
-    let mut bridge = Box::from_raw(private_data as *mut VoidBridge);
+    let mut bridge = Box::from_raw(private_data as *mut CompletionBridge);
     let result = if err < 0 {
-        let msg = if nfs.is_null() {
-            String::from("unknown error")
-        } else {
-            let p = sys::nfs_get_error(nfs);
-            if p.is_null() {
-                String::from("unknown error")
-            } else {
-                CStr::from_ptr(p).to_string_lossy().into_owned()
-            }
-        };
-        eprintln!("[libnfs] void_cb: err={err} msg={msg}");
+        let msg = crate::get_error_message(nfs, err);
+        eprintln!("[libnfs] completion_cb: err={err} msg={msg}");
         Err((err as i32, msg))
     } else {
-        eprintln!("[libnfs] void_cb: success (err={err})");
+        eprintln!("[libnfs] completion_cb: success (err={err})");
         Ok(())
     };
     if let Some(tx) = bridge.tx.take() {
-        eprintln!("[libnfs] void_cb: sending result through oneshot");
+        eprintln!("[libnfs] completion_cb: sending result through oneshot");
         let _ = tx.send(result);
     } else {
-        eprintln!("[libnfs] void_cb: WARNING — no sender available (already taken?)");
+        eprintln!("[libnfs] completion_cb: WARNING — no sender available");
     }
 }
 
@@ -166,7 +160,7 @@ struct FhBridge {
     tx: Option<oneshot::Sender<std::result::Result<FhPtr, (i32, String)>>>,
 }
 
-unsafe extern "C" fn fh_cb(
+unsafe extern "C" fn open_cb(
     err: c_int,
     nfs: *mut sys::nfs_context,
     data: *mut c_void,
@@ -174,7 +168,7 @@ unsafe extern "C" fn fh_cb(
 ) {
     let mut bridge = Box::from_raw(private_data as *mut FhBridge);
     let result = if err < 0 {
-        let msg = crate::get_error_string(nfs);
+        let msg = crate::get_error_message(nfs, err);
         Err((err as i32, msg))
     } else {
         Ok(FhPtr(data as *mut sys::nfsfh))
@@ -198,7 +192,7 @@ unsafe extern "C" fn stat_cb(
 ) {
     let mut bridge = Box::from_raw(private_data as *mut StatBridge);
     let result = if err < 0 {
-        let msg = crate::get_error_string(nfs);
+        let msg = crate::get_error_message(nfs, err);
         Err((err as i32, msg))
     } else {
         let st = &*(data as *const sys::nfs_stat_64);
@@ -230,7 +224,7 @@ unsafe extern "C" fn read_into_cb(
 ) {
     let mut bridge = Box::from_raw(private_data as *mut ReadIntoBridge);
     let result = if err < 0 {
-        let msg = crate::get_error_string(nfs);
+        let msg = crate::get_error_message(nfs, err);
         Err((err as i32, msg))
     } else {
         let bytes_read = err as usize;
@@ -249,7 +243,7 @@ struct DirBridge {
     tx: Option<oneshot::Sender<std::result::Result<DirPtr, (i32, String)>>>,
 }
 
-unsafe extern "C" fn dir_cb(
+unsafe extern "C" fn opendir_cb(
     err: c_int,
     nfs: *mut sys::nfs_context,
     data: *mut c_void,
@@ -257,7 +251,7 @@ unsafe extern "C" fn dir_cb(
 ) {
     let mut bridge = Box::from_raw(private_data as *mut DirBridge);
     let result = if err < 0 {
-        let msg = crate::get_error_string(nfs);
+        let msg = crate::get_error_message(nfs, err);
         Err((err as i32, msg))
     } else {
         Ok(DirPtr(data as *mut sys::nfsdir))
@@ -267,17 +261,36 @@ unsafe extern "C" fn dir_cb(
     }
 }
 
-fn get_error_string(nfs: *mut sys::nfs_context) -> String {
+/// Build a human-readable error message from a libnfs callback.
+///
+/// 1. Try `nfs_get_error(nfs)` — libnfs's own message.
+/// 2. If that's null/empty, interpret `err` as a negated errno and
+///    use `strerror(-err)` (e.g. -14 → EFAULT → "Bad address").
+/// 3. Last resort: return the raw numeric code.
+pub(crate) fn get_error_message(nfs: *mut sys::nfs_context, err: c_int) -> String {
     unsafe {
-        if nfs.is_null() {
-            return String::from("unknown error");
+        // Try libnfs's own error string first.
+        if !nfs.is_null() {
+            let p = sys::nfs_get_error(nfs);
+            if !p.is_null() {
+                let s = CStr::from_ptr(p).to_string_lossy();
+                if !s.is_empty() {
+                    return s.into_owned();
+                }
+            }
         }
-        let p = sys::nfs_get_error(nfs);
-        if p.is_null() {
-            String::from("unknown error")
-        } else {
-            CStr::from_ptr(p).to_string_lossy().into_owned()
+        // Fall back to strerror for negated errno values.
+        if err < 0 {
+            let errno_val = -err as c_int;
+            let p = libc::strerror(errno_val);
+            if !p.is_null() {
+                let s = CStr::from_ptr(p).to_string_lossy();
+                if !s.is_empty() {
+                    return format!("{} (errno {})", s, errno_val);
+                }
+            }
         }
+        format!("unknown error (code {})", err)
     }
 }
 
@@ -378,6 +391,9 @@ impl Client {
             eprintln!("[libnfs] mount: nfs_init_context returned null");
             return Err(Error::ContextCreation);
         }
+        // Enable libnfs internal debug logging — prints protocol details
+        // to stderr, invaluable for diagnosing mount failures.
+        unsafe { sys::nfs_set_debug(ctx, 2) };
         eprintln!(
             "[libnfs] mount: context created, setting version to {:?}",
             version
@@ -389,7 +405,7 @@ impl Client {
         let export_c = CString::new(export)?;
         let (tx, rx) = oneshot::channel();
 
-        let bridge = Box::new(VoidBridge { tx: Some(tx) });
+        let bridge = Box::new(CompletionBridge { tx: Some(tx) });
         let private_data = Box::into_raw(bridge) as *mut c_void;
 
         eprintln!("[libnfs] mount: calling nfs_mount_async");
@@ -398,14 +414,14 @@ impl Client {
                 ctx,
                 server_c.as_ptr(),
                 export_c.as_ptr(),
-                void_cb,
+                completion_cb,
                 private_data,
             )
         };
         if rc != 0 {
-            let msg = get_error_string(ctx);
+            let msg = get_error_message(ctx, rc);
             eprintln!("[libnfs] mount: nfs_mount_async failed rc={rc}: {msg}");
-            unsafe { drop(Box::from_raw(private_data as *mut VoidBridge)) };
+            unsafe { drop(Box::from_raw(private_data as *mut CompletionBridge)) };
             unsafe { sys::nfs_destroy_context(ctx) };
             return Err(Error::Submit(msg));
         }
@@ -464,7 +480,7 @@ impl Client {
         let export_c = CString::new(export)?;
         let (tx, rx) = oneshot::channel();
 
-        let bridge = Box::new(VoidBridge { tx: Some(tx) });
+        let bridge = Box::new(CompletionBridge { tx: Some(tx) });
         let private_data = Box::into_raw(bridge) as *mut c_void;
 
         let rc = unsafe {
@@ -472,13 +488,13 @@ impl Client {
                 ctx,
                 server_c.as_ptr(),
                 export_c.as_ptr(),
-                void_cb,
+                completion_cb,
                 private_data,
             )
         };
         if rc != 0 {
-            unsafe { drop(Box::from_raw(private_data as *mut VoidBridge)) };
-            let msg = get_error_string(ctx);
+            unsafe { drop(Box::from_raw(private_data as *mut CompletionBridge)) };
+            let msg = get_error_message(ctx, rc);
             unsafe { sys::nfs_destroy_context(ctx) };
             return Err(Error::Submit(msg));
         }
@@ -517,9 +533,9 @@ impl Client {
             let rc = unsafe { sys::nfs_stat64_async(ctx, path_c.as_ptr(), stat_cb, pd) };
             if rc != 0 {
                 let mut bridge = unsafe { Box::from_raw(pd as *mut StatBridge) };
-                let msg = get_error_string(ctx);
+                let msg = get_error_message(ctx, rc);
                 if let Some(tx) = bridge.tx.take() {
-                    let _ = tx.send(Err((-1, msg)));
+                    let _ = tx.send(Err((rc, msg)));
                 }
             }
         }))?;
@@ -538,12 +554,12 @@ impl Client {
         self.submit(Box::new(move |ctx| {
             let bridge = Box::new(FhBridge { tx: Some(tx) });
             let pd = Box::into_raw(bridge) as *mut c_void;
-            let rc = unsafe { sys::nfs_open_async(ctx, path_c.as_ptr(), sys::O_RDONLY, fh_cb, pd) };
+            let rc = unsafe { sys::nfs_open_async(ctx, path_c.as_ptr(), sys::O_RDONLY, open_cb, pd) };
             if rc != 0 {
                 let mut bridge = unsafe { Box::from_raw(pd as *mut FhBridge) };
-                let msg = get_error_string(ctx);
+                let msg = get_error_message(ctx, rc);
                 if let Some(tx) = bridge.tx.take() {
-                    let _ = tx.send(Err((-1, msg)));
+                    let _ = tx.send(Err((rc, msg)));
                 }
             }
         }))?;
@@ -565,12 +581,12 @@ impl Client {
         self.submit(Box::new(move |ctx| {
             let bridge = Box::new(DirBridge { tx: Some(tx) });
             let pd = Box::into_raw(bridge) as *mut c_void;
-            let rc = unsafe { sys::nfs_opendir_async(ctx, path_c.as_ptr(), dir_cb, pd) };
+            let rc = unsafe { sys::nfs_opendir_async(ctx, path_c.as_ptr(), opendir_cb, pd) };
             if rc != 0 {
                 let mut bridge = unsafe { Box::from_raw(pd as *mut DirBridge) };
-                let msg = get_error_string(ctx);
+                let msg = get_error_message(ctx, rc);
                 if let Some(tx) = bridge.tx.take() {
-                    let _ = tx.send(Err((-1, msg)));
+                    let _ = tx.send(Err((rc, msg)));
                 }
             }
         }))?;
@@ -677,9 +693,9 @@ impl File {
             };
             if rc != 0 {
                 let mut bridge = unsafe { Box::from_raw(pd as *mut ReadIntoBridge) };
-                let msg = get_error_string(ctx);
+                let msg = get_error_message(ctx, rc);
                 if let Some(tx) = bridge.tx.take() {
-                    let _ = tx.send(Err((-1, msg)));
+                    let _ = tx.send(Err((rc, msg)));
                 }
             }
         }))?;
@@ -698,9 +714,9 @@ impl File {
             let rc = unsafe { sys::nfs_fstat64_async(ctx, fh.get(), stat_cb, pd) };
             if rc != 0 {
                 let mut bridge = unsafe { Box::from_raw(pd as *mut StatBridge) };
-                let msg = get_error_string(ctx);
+                let msg = get_error_message(ctx, rc);
                 if let Some(tx) = bridge.tx.take() {
-                    let _ = tx.send(Err((-1, msg)));
+                    let _ = tx.send(Err((rc, msg)));
                 }
             }
         }))?;
@@ -715,14 +731,14 @@ impl File {
         let fh = FhPtr(self.fh);
 
         self.submit(Box::new(move |ctx| {
-            let bridge = Box::new(VoidBridge { tx: Some(tx) });
+            let bridge = Box::new(CompletionBridge { tx: Some(tx) });
             let pd = Box::into_raw(bridge) as *mut c_void;
-            let rc = unsafe { sys::nfs_close_async(ctx, fh.get(), void_cb, pd) };
+            let rc = unsafe { sys::nfs_close_async(ctx, fh.get(), completion_cb, pd) };
             if rc != 0 {
-                let mut bridge = unsafe { Box::from_raw(pd as *mut VoidBridge) };
-                let msg = get_error_string(ctx);
+                let mut bridge = unsafe { Box::from_raw(pd as *mut CompletionBridge) };
+                let msg = get_error_message(ctx, rc);
                 if let Some(tx) = bridge.tx.take() {
-                    let _ = tx.send(Err((-1, msg)));
+                    let _ = tx.send(Err((rc, msg)));
                 }
             }
         }))?;
@@ -741,9 +757,9 @@ impl Drop for File {
         if !self.fh.is_null() {
             let fh = FhPtr(self.fh);
             let _ = self.client.event_loop.submit(Box::new(move |ctx| unsafe {
-                let bridge = Box::new(VoidBridge { tx: None });
+                let bridge = Box::new(CompletionBridge { tx: None });
                 let pd = Box::into_raw(bridge) as *mut c_void;
-                sys::nfs_close_async(ctx, fh.get(), void_cb, pd);
+                sys::nfs_close_async(ctx, fh.get(), completion_cb, pd);
             }));
         }
     }

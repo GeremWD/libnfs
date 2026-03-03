@@ -185,7 +185,11 @@ fn try_service(ctx: *mut sys::nfs_context, fd: RawFd, wanted: i32) -> bool {
             fmt_poll(pfd.revents as i32)
         );
         let fd_before = unsafe { sys::nfs_get_fd(ctx) };
-        unsafe { sys::nfs_service(ctx, pfd.revents as i32) };
+        let rc = unsafe { sys::nfs_service(ctx, pfd.revents as i32) };
+        if rc < 0 {
+            let err = crate::get_error_message(ctx, rc);
+            eprintln!("[libnfs] try_service: nfs_service returned {rc}: {err}");
+        }
         let fd_after = unsafe { sys::nfs_get_fd(ctx) };
         if fd_after != fd_before {
             eprintln!(
@@ -298,7 +302,11 @@ async fn driver_loop(
                         let revents = interest_to_poll_flags(&guard);
                         eprintln!("[libnfs] driver_loop [#{iteration}]: ready fd={current_fd} revents={}", fmt_poll(revents));
                         let fd_before = unsafe { sys::nfs_get_fd(ctx.0) };
-                        unsafe { sys::nfs_service(ctx.0, revents) };
+                        let rc = unsafe { sys::nfs_service(ctx.0, revents) };
+                        if rc < 0 {
+                            let err = crate::get_error_message(ctx.0, rc);
+                            eprintln!("[libnfs] driver_loop [#{iteration}]: nfs_service returned {rc}: {err}");
+                        }
                         let fd_after = unsafe { sys::nfs_get_fd(ctx.0) };
                         if fd_after != fd_before {
                             eprintln!("[libnfs] driver_loop [#{iteration}]: fd changed {fd_before} → {fd_after} after nfs_service");
