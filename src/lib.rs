@@ -283,6 +283,7 @@ pub(crate) fn get_error_message(
             let p = data as *const std::os::raw::c_char;
             let s = CStr::from_ptr(p).to_string_lossy();
             if !s.is_empty() {
+                eprintln!("[libnfs] get_error_message: source=callback_data msg={s:?}");
                 return s.into_owned();
             }
         }
@@ -292,6 +293,7 @@ pub(crate) fn get_error_message(
             if !p.is_null() {
                 let s = CStr::from_ptr(p).to_string_lossy();
                 if !s.is_empty() {
+                    eprintln!("[libnfs] get_error_message: source=nfs_get_error msg={s:?}");
                     return s.into_owned();
                 }
             }
@@ -303,11 +305,15 @@ pub(crate) fn get_error_message(
             if !p.is_null() {
                 let s = CStr::from_ptr(p).to_string_lossy();
                 if !s.is_empty() {
-                    return format!("{} (errno {})", s, errno_val);
+                    let msg = format!("{} (errno {})", s, errno_val);
+                    eprintln!("[libnfs] get_error_message: source=strerror msg={msg:?}");
+                    return msg;
                 }
             }
         }
-        format!("unknown error (code {})", err)
+        let msg = format!("unknown error (code {})", err);
+        eprintln!("[libnfs] get_error_message: source=fallback msg={msg:?}");
+        msg
     }
 }
 
@@ -369,21 +375,17 @@ impl DirPtr {
 
 impl Drop for NfsInner {
     fn drop(&mut self) {
-        // 1. Signal the event loop to stop.
+        // 1. Signal the event loop to stop (sets flag + wakes poll).
         self.event_loop.stop();
 
-        // 2. Abort the task so nfs_service() is no longer called.
-        //    After abort(), the task is cancelled at its next yield point
-        //    and will not touch the nfs_context again.
-        if let Some(task) = self.event_loop.take_task() {
-            task.abort();
+        // 2. Wait for the poll thread to finish.  stop() already
+        //    wrote to the wake pipe, so the thread will see the flag
+        //    and exit promptly.
+        if let Some(thread) = self.event_loop.take_task() {
+            let _ = thread.join();
         }
 
-        // 3. Small yield to let the runtime process the abort.
-        //    Use a thread::sleep rather than async — we're in Drop.
-        std::thread::sleep(std::time::Duration::from_millis(1));
-
-        // 4. Now safe to destroy the context.
+        // 3. Now safe to destroy the context.
         if !self.ctx.is_null() {
             unsafe { sys::nfs_destroy_context(self.ctx) };
         }
