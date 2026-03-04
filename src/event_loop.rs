@@ -187,7 +187,7 @@ fn try_service(ctx: *mut sys::nfs_context, fd: RawFd, wanted: i32) -> bool {
         let fd_before = unsafe { sys::nfs_get_fd(ctx) };
         let rc = unsafe { sys::nfs_service(ctx, pfd.revents as i32) };
         if rc < 0 {
-            let err = crate::get_error_message(ctx, rc);
+            let err = crate::get_error_message(ctx, rc, std::ptr::null_mut());
             eprintln!("[libnfs] try_service: nfs_service returned {rc}: {err}");
         }
         let fd_after = unsafe { sys::nfs_get_fd(ctx) };
@@ -304,7 +304,7 @@ async fn driver_loop(
                         let fd_before = unsafe { sys::nfs_get_fd(ctx.0) };
                         let rc = unsafe { sys::nfs_service(ctx.0, revents) };
                         if rc < 0 {
-                            let err = crate::get_error_message(ctx.0, rc);
+                            let err = crate::get_error_message(ctx.0, rc, std::ptr::null_mut());
                             eprintln!("[libnfs] driver_loop [#{iteration}]: nfs_service returned {rc}: {err}");
                         }
                         let fd_after = unsafe { sys::nfs_get_fd(ctx.0) };

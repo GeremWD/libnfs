@@ -134,12 +134,12 @@ struct CompletionBridge {
 unsafe extern "C" fn completion_cb(
     err: c_int,
     nfs: *mut sys::nfs_context,
-    _data: *mut c_void,
+    data: *mut c_void,
     private_data: *mut c_void,
 ) {
     let mut bridge = Box::from_raw(private_data as *mut CompletionBridge);
     let result = if err < 0 {
-        let msg = crate::get_error_message(nfs, err);
+        let msg = crate::get_error_message(nfs, err, data);
         eprintln!("[libnfs] completion_cb: err={err} msg={msg}");
         Err((err as i32, msg))
     } else {
@@ -168,7 +168,7 @@ unsafe extern "C" fn open_cb(
 ) {
     let mut bridge = Box::from_raw(private_data as *mut FhBridge);
     let result = if err < 0 {
-        let msg = crate::get_error_message(nfs, err);
+        let msg = crate::get_error_message(nfs, err, data);
         Err((err as i32, msg))
     } else {
         Ok(FhPtr(data as *mut sys::nfsfh))
@@ -192,7 +192,7 @@ unsafe extern "C" fn stat_cb(
 ) {
     let mut bridge = Box::from_raw(private_data as *mut StatBridge);
     let result = if err < 0 {
-        let msg = crate::get_error_message(nfs, err);
+        let msg = crate::get_error_message(nfs, err, data);
         Err((err as i32, msg))
     } else {
         let st = &*(data as *const sys::nfs_stat_64);
@@ -224,7 +224,7 @@ unsafe extern "C" fn read_into_cb(
 ) {
     let mut bridge = Box::from_raw(private_data as *mut ReadIntoBridge);
     let result = if err < 0 {
-        let msg = crate::get_error_message(nfs, err);
+        let msg = crate::get_error_message(nfs, err, data);
         Err((err as i32, msg))
     } else {
         let bytes_read = err as usize;
@@ -251,7 +251,7 @@ unsafe extern "C" fn opendir_cb(
 ) {
     let mut bridge = Box::from_raw(private_data as *mut DirBridge);
     let result = if err < 0 {
-        let msg = crate::get_error_message(nfs, err);
+        let msg = crate::get_error_message(nfs, err, data);
         Err((err as i32, msg))
     } else {
         Ok(DirPtr(data as *mut sys::nfsdir))
@@ -263,13 +263,30 @@ unsafe extern "C" fn opendir_cb(
 
 /// Build a human-readable error message from a libnfs callback.
 ///
-/// 1. Try `nfs_get_error(nfs)` — libnfs's own message.
-/// 2. If that's null/empty, interpret `err` as a negated errno and
-///    use `strerror(-err)` (e.g. -14 → EFAULT → "Bad address").
-/// 3. Last resort: return the raw numeric code.
-pub(crate) fn get_error_message(nfs: *mut sys::nfs_context, err: c_int) -> String {
+/// In libnfs, when a callback fires with `err < 0`, the `data`
+/// parameter is a `const char *` containing the RPC / protocol
+/// error string.  This is the **primary** error message source.
+///
+/// Fallback order:
+/// 1. `data` pointer from the callback (cast to `*const c_char`).
+/// 2. `nfs_get_error(nfs)` — libnfs's context-level error.
+/// 3. `strerror(-err)` — interpret as negated errno.
+/// 4. Raw numeric code.
+pub(crate) fn get_error_message(
+    nfs: *mut sys::nfs_context,
+    err: c_int,
+    data: *mut c_void,
+) -> String {
     unsafe {
-        // Try libnfs's own error string first.
+        // 1. The callback's `data` pointer IS the error string when err < 0.
+        if err < 0 && !data.is_null() {
+            let p = data as *const std::os::raw::c_char;
+            let s = CStr::from_ptr(p).to_string_lossy();
+            if !s.is_empty() {
+                return s.into_owned();
+            }
+        }
+        // 2. Try libnfs's own context error string.
         if !nfs.is_null() {
             let p = sys::nfs_get_error(nfs);
             if !p.is_null() {
@@ -279,7 +296,7 @@ pub(crate) fn get_error_message(nfs: *mut sys::nfs_context, err: c_int) -> Strin
                 }
             }
         }
-        // Fall back to strerror for negated errno values.
+        // 3. Fall back to strerror for negated errno values.
         if err < 0 {
             let errno_val = -err as c_int;
             let p = libc::strerror(errno_val);
@@ -419,7 +436,7 @@ impl Client {
             )
         };
         if rc != 0 {
-            let msg = get_error_message(ctx, rc);
+            let msg = get_error_message(ctx, rc, std::ptr::null_mut());
             eprintln!("[libnfs] mount: nfs_mount_async failed rc={rc}: {msg}");
             unsafe { drop(Box::from_raw(private_data as *mut CompletionBridge)) };
             unsafe { sys::nfs_destroy_context(ctx) };
@@ -494,7 +511,7 @@ impl Client {
         };
         if rc != 0 {
             unsafe { drop(Box::from_raw(private_data as *mut CompletionBridge)) };
-            let msg = get_error_message(ctx, rc);
+            let msg = get_error_message(ctx, rc, std::ptr::null_mut());
             unsafe { sys::nfs_destroy_context(ctx) };
             return Err(Error::Submit(msg));
         }
@@ -533,7 +550,7 @@ impl Client {
             let rc = unsafe { sys::nfs_stat64_async(ctx, path_c.as_ptr(), stat_cb, pd) };
             if rc != 0 {
                 let mut bridge = unsafe { Box::from_raw(pd as *mut StatBridge) };
-                let msg = get_error_message(ctx, rc);
+                let msg = get_error_message(ctx, rc, std::ptr::null_mut());
                 if let Some(tx) = bridge.tx.take() {
                     let _ = tx.send(Err((rc, msg)));
                 }
@@ -558,7 +575,7 @@ impl Client {
                 unsafe { sys::nfs_open_async(ctx, path_c.as_ptr(), sys::O_RDONLY, open_cb, pd) };
             if rc != 0 {
                 let mut bridge = unsafe { Box::from_raw(pd as *mut FhBridge) };
-                let msg = get_error_message(ctx, rc);
+                let msg = get_error_message(ctx, rc, std::ptr::null_mut());
                 if let Some(tx) = bridge.tx.take() {
                     let _ = tx.send(Err((rc, msg)));
                 }
@@ -585,7 +602,7 @@ impl Client {
             let rc = unsafe { sys::nfs_opendir_async(ctx, path_c.as_ptr(), opendir_cb, pd) };
             if rc != 0 {
                 let mut bridge = unsafe { Box::from_raw(pd as *mut DirBridge) };
-                let msg = get_error_message(ctx, rc);
+                let msg = get_error_message(ctx, rc, std::ptr::null_mut());
                 if let Some(tx) = bridge.tx.take() {
                     let _ = tx.send(Err((rc, msg)));
                 }
@@ -694,7 +711,7 @@ impl File {
             };
             if rc != 0 {
                 let mut bridge = unsafe { Box::from_raw(pd as *mut ReadIntoBridge) };
-                let msg = get_error_message(ctx, rc);
+                let msg = get_error_message(ctx, rc, std::ptr::null_mut());
                 if let Some(tx) = bridge.tx.take() {
                     let _ = tx.send(Err((rc, msg)));
                 }
@@ -715,7 +732,7 @@ impl File {
             let rc = unsafe { sys::nfs_fstat64_async(ctx, fh.get(), stat_cb, pd) };
             if rc != 0 {
                 let mut bridge = unsafe { Box::from_raw(pd as *mut StatBridge) };
-                let msg = get_error_message(ctx, rc);
+                let msg = get_error_message(ctx, rc, std::ptr::null_mut());
                 if let Some(tx) = bridge.tx.take() {
                     let _ = tx.send(Err((rc, msg)));
                 }
@@ -737,7 +754,7 @@ impl File {
             let rc = unsafe { sys::nfs_close_async(ctx, fh.get(), completion_cb, pd) };
             if rc != 0 {
                 let mut bridge = unsafe { Box::from_raw(pd as *mut CompletionBridge) };
-                let msg = get_error_message(ctx, rc);
+                let msg = get_error_message(ctx, rc, std::ptr::null_mut());
                 if let Some(tx) = bridge.tx.take() {
                     let _ = tx.send(Err((rc, msg)));
                 }
